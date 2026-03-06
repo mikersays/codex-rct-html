@@ -1,0 +1,10 @@
+node_modules/
+dist/
+output/
+tmp/
+
+*.log
+.DS_Store
+
+playtest-shot.png
+initial-shot.png
