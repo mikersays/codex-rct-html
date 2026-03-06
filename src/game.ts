@@ -227,7 +227,7 @@ const STRUCTURES: Record<StructureTypeId, StructureConfig> = {
     capacity: 2,
     cycleTime: 4,
     excitement: 4,
-    appetite: 26,
+    appetite: 32,
     palette: ["#e7a45e", "#c4553c", "#f8edd9"]
   },
   gelato: {
@@ -241,7 +241,7 @@ const STRUCTURES: Record<StructureTypeId, StructureConfig> = {
     capacity: 1,
     cycleTime: 3,
     excitement: 3,
-    appetite: 18,
+    appetite: 22,
     palette: ["#8dd4c2", "#f06da3", "#f8f3e8"]
   },
   coffee: {
@@ -255,18 +255,18 @@ const STRUCTURES: Record<StructureTypeId, StructureConfig> = {
     capacity: 2,
     cycleTime: 4,
     excitement: 5,
-    appetite: 14,
+    appetite: 18,
     palette: ["#8d6748", "#f0d17b", "#f8f0e6"]
   }
 };
 
 const SCENERY: Record<SceneryTypeId, SceneryConfig> = {
-  tree: { id: "tree", label: "Canopy Tree", cost: 18, beauty: 8 },
-  flower: { id: "flower", label: "Flower Bed", cost: 14, beauty: 5 },
-  fountain: { id: "fountain", label: "Fountain", cost: 78, beauty: 12 },
-  bench: { id: "bench", label: "Bench", cost: 24, beauty: 4 },
-  bin: { id: "bin", label: "Litter Bin", cost: 20, beauty: 1, binPower: 1.2 },
-  lamp: { id: "lamp", label: "Lantern", cost: 26, beauty: 4, glow: true }
+  tree: { id: "tree", label: "Canopy Tree", cost: 18, beauty: 12 },
+  flower: { id: "flower", label: "Flower Bed", cost: 14, beauty: 7 },
+  fountain: { id: "fountain", label: "Fountain", cost: 78, beauty: 18 },
+  bench: { id: "bench", label: "Bench", cost: 24, beauty: 6 },
+  bin: { id: "bin", label: "Litter Bin", cost: 20, beauty: 2, binPower: 1.2 },
+  lamp: { id: "lamp", label: "Lantern", cost: 26, beauty: 6, glow: true }
 };
 
 function clamp(value: number, min: number, max: number): number {
@@ -396,6 +396,17 @@ export class ThemeParkGame {
   private lastFrame = performance.now();
   private keys = new Set<string>();
 
+  // --- Performance caches ---
+  private cachedTileSurface: Path2D | null = null;
+  private cachedPathShape: Path2D | null = null;
+  private beautyGrid: Float32Array = new Float32Array(GRID_W * GRID_H);
+  private binPowerGrid: Float32Array = new Float32Array(GRID_W * GRID_H);
+  private beautyCacheDirty = true;
+  private cachedCleanliness = 72;
+  private cachedHappiness = 72;
+  private frameCacheDirty = true;
+  private lastUiUpdate = 0;
+
   constructor(root: HTMLElement) {
     this.root = root;
     this.shell = document.createElement("div");
@@ -493,7 +504,36 @@ export class ThemeParkGame {
       setTool: (toolId: ToolId) => {
         this.selectedTool = toolId;
         this.updateUi();
-      }
+      },
+      getGuests: () => Array.from(this.guests.values()).map((g) => ({
+        id: g.id,
+        tile: { ...g.tile },
+        state: g.state,
+        targetStructureId: g.targetStructureId,
+        hunger: g.hunger,
+        happiness: g.happiness,
+        patience: g.patience,
+        excitement: g.excitement,
+        activity: g.activity,
+        waitTimer: g.waitTimer,
+        rideTimer: g.rideTimer,
+        routeLength: g.route.length,
+        routeIndex: g.routeIndex,
+        ridesTaken: g.ridesTaken,
+        queueSlot: g.queueSlot
+      })),
+      getStructures: () => Array.from(this.structures.values()).map((s) => ({
+        id: s.id,
+        typeId: s.typeId,
+        x: s.x,
+        y: s.y,
+        queue: [...s.queue],
+        riders: [...s.riders],
+        cycle: s.cycle,
+        status: s.status,
+        lifetimeGuests: s.lifetimeGuests
+      })),
+      getTime: () => this.time
     };
   }
 
@@ -648,13 +688,17 @@ export class ThemeParkGame {
     this.camera.y = lerp(this.camera.y, this.camera.targetY, clamp(dt * 7, 0, 1));
     this.camera.zoom = lerp(this.camera.zoom, this.camera.targetZoom, clamp(dt * 10, 0, 1));
 
-    const upkeep = Array.from(this.structures.values()).reduce((sum, structure) => sum + STRUCTURES[structure.typeId].upkeep, 0);
-    this.money -= upkeep * dt;
+    this.frameCacheDirty = true;
+
+    let upkeep = 0;
+    for (const structure of this.structures.values()) upkeep += STRUCTURES[structure.typeId].upkeep;
+    this.money = Math.max(0, this.money - upkeep * dt);
 
     for (const structure of this.structures.values()) {
       this.updateStructure(structure, dt);
     }
 
+    this.refreshFrameCache();
     for (const guest of this.guests.values()) {
       this.updateGuest(guest, dt);
     }
@@ -663,18 +707,22 @@ export class ThemeParkGame {
     if (this.guestSpawnTimer <= 0 && this.guests.size < this.maxGuestCapacity()) {
       this.spawnGuest();
       const densityPenalty = Math.max(0, this.guestQueuePressure() - 1.4) * 0.45;
-      this.guestSpawnTimer = clamp(4.4 - this.parkLevel() * 0.25 - this.attractionCount() * 0.14 + densityPenalty, 1.2, 5.8);
+      this.guestSpawnTimer = clamp(3.2 - this.parkLevel() * 0.35 - this.attractionCount() * 0.18 + densityPenalty, 0.9, 4.6);
     }
 
+    this.rebuildBeautyCache();
     for (let y = 0; y < GRID_H; y += 1) {
       for (let x = 0; x < GRID_W; x += 1) {
         const tile = this.tiles[y][x];
-        tile.litter = Math.max(0, tile.litter - dt * 0.018 * (1 + this.localBinPower(x, y)));
+        if (tile.litter > 0) {
+          tile.litter = Math.max(0, tile.litter - dt * 0.018 * (1 + this.binPowerGrid[y * GRID_W + x]));
+        }
       }
     }
 
-    this.parkGrowth += dt * (this.averageHappiness() * 0.002 + this.cleanlinessScore() * 0.0015 + this.attractionCount() * 0.04);
-    if (Math.floor(this.time) % 5 === 0) {
+    this.parkGrowth += dt * (this.cachedHappiness * 0.002 + this.cachedCleanliness * 0.0015 + this.attractionCount() * 0.04);
+    if (this.time - this.lastUiUpdate >= 1.0) {
+      this.lastUiUpdate = this.time;
       this.updateUi();
     }
   }
@@ -701,7 +749,7 @@ export class ThemeParkGame {
         guest.activity = `Finished ${config.label}`;
       }
       structure.riders = [];
-      this.logEvent(`${config.label} wrapped up a cycle with cheering guests.`);
+      this.logEvent(`${config.label} finished a cycle -- ${structure.riders.length} guests disembarked.`, "earn");
     }
 
     if ((structure.status === "idle" || structure.status === "boarding") && structure.queue.length > 0) {
@@ -730,7 +778,7 @@ export class ThemeParkGame {
 
         if (config.category === "stall") {
           guest.hunger = clamp(guest.hunger - config.appetite, 0, 100);
-          guest.happiness = clamp(guest.happiness + 6, 0, 100);
+          guest.happiness = clamp(guest.happiness + 8, 0, 100);
         }
 
         const entrance = structureEntrance(structure);
@@ -742,10 +790,10 @@ export class ThemeParkGame {
   }
 
   private updateGuest(guest: Guest, dt: number): void {
-    guest.hunger = clamp(guest.hunger + dt * 1.2, 0, 100);
+    guest.hunger = clamp(guest.hunger + dt * 1.8, 0, 100);
     guest.patience = clamp(guest.patience - dt * (guest.state === "queueing" ? 1.6 : 0.2), 0, 100);
-    guest.happiness = clamp(guest.happiness - dt * (this.cleanlinessScore() < 60 ? 0.42 : 0.07), 10, 100);
-    guest.happiness = clamp(guest.happiness + this.localBeauty(guest.tile.x, guest.tile.y) * dt * 0.04, 10, 100);
+    guest.happiness = clamp(guest.happiness - dt * (this.cachedCleanliness < 60 ? 0.42 : 0.07), 10, 100);
+    guest.happiness = clamp(guest.happiness + this.beautyGrid[guest.tile.y * GRID_W + guest.tile.x] * dt * 0.08, 10, 100);
 
     if (guest.state === "thinking") {
       guest.rideTimer -= dt;
@@ -760,16 +808,32 @@ export class ThemeParkGame {
       if (!structure) {
         guest.state = "thinking";
         guest.rideTimer = 0.2;
+        guest.targetStructureId = undefined;
         return;
       }
       const index = structure.queue.indexOf(guest.id);
-      if (index >= 0) {
-        guest.queueSlot = index;
-        guest.waitTimer += dt;
-        guest.activity = `Queueing for ${STRUCTURES[structure.typeId].label}`;
-        if (guest.waitTimer > 10) {
-          guest.happiness = clamp(guest.happiness - dt * 0.75, 0, 100);
-        }
+      if (index < 0) {
+        // Guest thinks they're queueing but aren't in the queue -- recover
+        guest.state = "thinking";
+        guest.rideTimer = 0.3;
+        guest.targetStructureId = undefined;
+        return;
+      }
+      guest.queueSlot = index;
+      guest.waitTimer += dt;
+      guest.activity = `Queueing for ${STRUCTURES[structure.typeId].label}`;
+      if (guest.waitTimer > 10) {
+        guest.happiness = clamp(guest.happiness - dt * 0.75, 0, 100);
+      }
+      // Leave queue if patience runs out
+      if (guest.patience <= 5 && guest.waitTimer > 6) {
+        structure.queue.splice(index, 1);
+        guest.state = "thinking";
+        guest.rideTimer = 0.3;
+        guest.targetStructureId = undefined;
+        guest.happiness = clamp(guest.happiness - 8, 10, 100);
+        guest.activity = "Left queue impatiently";
+        this.logEvent(`A guest gave up waiting for ${STRUCTURES[structure.typeId].label}.`, "warn");
       }
       return;
     }
@@ -779,9 +843,11 @@ export class ThemeParkGame {
       return;
     }
 
-    if (guest.hunger > 82 && guest.ridesTaken > 0) {
+    if (guest.hunger > 58) {
       const foodOptions = Array.from(this.structures.values()).filter((structure) => STRUCTURES[structure.typeId].category === "stall");
-      if (foodOptions.length > 0 && (guest.targetStructureId === undefined || STRUCTURES[this.structures.get(guest.targetStructureId)?.typeId ?? "burger"].category !== "stall")) {
+      const currentTarget = guest.targetStructureId !== undefined ? this.structures.get(guest.targetStructureId) : undefined;
+      const alreadyHeadingToFood = currentTarget && STRUCTURES[currentTarget.typeId].category === "stall";
+      if (foodOptions.length > 0 && !alreadyHeadingToFood) {
         guest.state = "thinking";
         guest.rideTimer = 0.1;
         return;
@@ -843,7 +909,32 @@ export class ThemeParkGame {
     guest.activity = `Joining ${STRUCTURES[structure.typeId].label}`;
   }
 
+  private rescueStrandedGuest(guest: Guest): void {
+    // Teleport stranded guest back to spawn if they can't find any path
+    const spawn = { x: BASE_SPAWN.x, y: GRID_H - 2 };
+    guest.tile = spawn;
+    guest.screenOffset = { x: 0, y: 0 };
+    guest.route = [spawn];
+    guest.routeIndex = 0;
+    guest.state = "thinking";
+    guest.rideTimer = 0.5;
+    guest.targetStructureId = undefined;
+    guest.activity = "Returned to entrance";
+  }
+
   private assignDestination(guest: Guest): void {
+    // If guest is already at a structure entrance, go directly to queueing
+    if (guest.targetStructureId !== undefined) {
+      const structure = this.structures.get(guest.targetStructureId);
+      if (structure) {
+        const entrance = structureEntrance(structure);
+        if (guest.tile.x === entrance.x && guest.tile.y === entrance.y) {
+          this.onGuestArrive(guest);
+          return;
+        }
+      }
+    }
+
     const attractions = Array.from(this.structures.values()).filter((structure) => {
       const entrance = structureEntrance(structure);
       return this.inBounds(entrance.x, entrance.y) && this.tiles[entrance.y][entrance.x].path;
@@ -851,7 +942,12 @@ export class ThemeParkGame {
 
     if (attractions.length === 0) {
       guest.targetStructureId = undefined;
-      guest.route = this.findRoute(guest.tile, BASE_SPAWN) ?? [guest.tile];
+      const route = this.findRoute(guest.tile, BASE_SPAWN);
+      if (!route) {
+        this.rescueStrandedGuest(guest);
+        return;
+      }
+      guest.route = route;
       guest.routeIndex = 0;
       guest.state = "walking";
       guest.activity = "Circling the plaza";
@@ -872,7 +968,12 @@ export class ThemeParkGame {
 
     if (!route) {
       guest.targetStructureId = undefined;
-      guest.route = this.findRoute(guest.tile, BASE_SPAWN) ?? [guest.tile];
+      const fallback = this.findRoute(guest.tile, BASE_SPAWN);
+      if (!fallback) {
+        this.rescueStrandedGuest(guest);
+        return;
+      }
+      guest.route = fallback;
       guest.routeIndex = 0;
       guest.state = "walking";
       guest.activity = "Looking for a clear route";
@@ -1000,12 +1101,12 @@ export class ThemeParkGame {
     const tile = this.tiles[y][x];
     if (toolId === "path") {
       if (tile.terrain === "water" || tile.structureId !== undefined) {
-        this.logEvent("Paths need open ground.");
+        this.logEvent("Paths need open ground -- clear the tile first.", "warn");
         return;
       }
       if (!tile.path) {
         if (this.money < getTool("path").cost) {
-          this.logEvent("Not enough cash for more paving.");
+          this.logEvent(`Not enough cash for paving. Need ${formatMoney(getTool("path").cost)}, have ${formatMoney(this.money)}.`, "warn");
           return;
         }
         this.money -= getTool("path").cost;
@@ -1020,11 +1121,11 @@ export class ThemeParkGame {
 
     if (toolId === "water") {
       if (tile.structureId !== undefined || tile.path) {
-        this.logEvent("Clear structures and paths before reshaping water.");
+        this.logEvent("Clear structures and paths before placing water.", "warn");
         return;
       }
       if (this.money < getTool("water").cost) {
-        this.logEvent("Not enough cash for waterworks.");
+        this.logEvent(`Not enough cash for water. Need ${formatMoney(getTool("water").cost)}, have ${formatMoney(this.money)}.`, "warn");
         return;
       }
       this.money -= getTool("water").cost;
@@ -1034,13 +1135,14 @@ export class ThemeParkGame {
       return;
     }
 
-    if (tile.terrain === "water") {
-      if (this.money < getTool("grass").cost) {
-        this.logEvent("Not enough cash for meadow fill.");
-        return;
-      }
-      this.money -= getTool("grass").cost;
+    if (tile.terrain === "grass") {
+      return;
     }
+    if (this.money < getTool("grass").cost) {
+      this.logEvent(`Not enough cash for meadow fill. Need ${formatMoney(getTool("grass").cost)}, have ${formatMoney(this.money)}.`, "warn");
+      return;
+    }
+    this.money -= getTool("grass").cost;
     tile.terrain = "grass";
     this.selection = { type: "tile", x, y };
   }
@@ -1048,19 +1150,25 @@ export class ThemeParkGame {
   private tryPlaceScenery(id: SceneryTypeId, x: number, y: number): void {
     const tile = this.tiles[y][x];
     if (tile.terrain !== "grass" || tile.structureId !== undefined) {
-      this.logEvent("Scenery needs open ground.");
+      this.logEvent("Scenery needs open grass terrain -- no water or structures.", "warn");
       return;
     }
     const tool = getSceneryTool(id);
     if (this.money < tool.cost) {
-      this.logEvent("Not enough cash for more decorations.");
+      this.logEvent(`Can't afford ${SCENERY[id].label} (${formatMoney(SCENERY[id].cost)}). Current funds: ${formatMoney(this.money)}.`, "warn");
       return;
     }
     if (tile.sceneryId === id) {
       return;
     }
+    if (tile.sceneryId) {
+      const oldRefund = Math.round(SCENERY[tile.sceneryId].cost * 0.55);
+      this.money += oldRefund;
+      this.logEvent(`Replaced ${SCENERY[tile.sceneryId].label} (+${formatMoney(oldRefund)} refund).`, "earn");
+    }
     this.money -= tool.cost;
     tile.sceneryId = id;
+    this.invalidateBeautyCache();
     this.selection = { type: "scenery", x, y };
   }
 
@@ -1069,19 +1177,19 @@ export class ThemeParkGame {
     const entrance = { x: x + Math.floor(config.footprint.x / 2), y: y + config.footprint.y };
 
     if (!this.inBounds(entrance.x, entrance.y)) {
-      this.logEvent("That placement pushes the entrance out of bounds.");
+      this.logEvent("Entrance would be outside the park boundary. Move it inward.", "warn");
       return;
     }
 
     for (let ty = y; ty < y + config.footprint.y; ty += 1) {
       for (let tx = x; tx < x + config.footprint.x; tx += 1) {
         if (!this.inBounds(tx, ty)) {
-          this.logEvent("That attraction footprint is outside the park.");
+          this.logEvent("Footprint extends outside the park boundary.", "warn");
           return;
         }
         const tile = this.tiles[ty][tx];
         if (tile.terrain !== "grass" || tile.path || tile.structureId !== undefined) {
-          this.logEvent("Attractions need clear land with room to breathe.");
+          this.logEvent("Attractions need clear grass -- no paths, water, or other structures.", "warn");
           return;
         }
       }
@@ -1089,12 +1197,12 @@ export class ThemeParkGame {
 
     const entryTile = this.tiles[entrance.y][entrance.x];
     if (entryTile.terrain === "water" || entryTile.structureId !== undefined) {
-      this.logEvent("The attraction entrance needs a reachable front tile.");
+      this.logEvent("The entrance tile is blocked by water or another structure.", "warn");
       return;
     }
 
     if (this.money < config.cost) {
-      this.logEvent("Not enough cash for that build.");
+      this.logEvent(`Can't afford ${config.label} (${formatMoney(config.cost)}). Current funds: ${formatMoney(this.money)}.`, "warn");
       return;
     }
 
@@ -1120,9 +1228,10 @@ export class ThemeParkGame {
         this.tiles[ty][tx].path = false;
       }
     }
+    this.invalidateBeautyCache();
 
     this.selection = { type: "structure", structureId: structure.id, x, y };
-    this.logEvent(`${config.label} placed. Connect a path to the glowing entrance tile.`);
+    this.logEvent(`${config.label} built for ${formatMoney(config.cost)}! Connect a path to the entrance tile below it.`, "build");
   }
 
   private eraseAt(x: number, y: number): void {
@@ -1150,15 +1259,25 @@ export class ThemeParkGame {
         guest.targetStructureId = undefined;
         guest.rideTimer = 0.5;
       }
+      // Also clear targetStructureId for guests walking toward this structure
+      for (const guest of this.guests.values()) {
+        if (guest.targetStructureId === structure.id && guest.state === "walking") {
+          guest.targetStructureId = undefined;
+          guest.state = "thinking";
+          guest.rideTimer = 0.3;
+          guest.activity = "Destination removed";
+        }
+      }
       this.structures.delete(structure.id);
       this.selection = { type: null };
-      this.logEvent(`${config.label} removed for a ${formatMoney(refund)} refund.`);
+      this.logEvent(`${config.label} demolished. ${formatMoney(refund)} refunded (55% of cost).`, "earn");
       return;
     }
 
     if (tile.sceneryId) {
       const refund = Math.round(SCENERY[tile.sceneryId].cost * 0.55);
       tile.sceneryId = undefined;
+      this.invalidateBeautyCache();
       this.money += refund;
       this.selection = { type: "tile", x, y };
       return;
@@ -1167,7 +1286,7 @@ export class ThemeParkGame {
     if (tile.path) {
       tile.path = false;
       tile.litter = 0;
-      this.money += 3;
+      this.money += Math.round(getTool("path").cost * 0.55);
       this.selection = { type: "tile", x, y };
       return;
     }
@@ -1180,6 +1299,75 @@ export class ThemeParkGame {
 
   private inBounds(x: number, y: number): boolean {
     return x >= 0 && y >= 0 && x < GRID_W && y < GRID_H;
+  }
+
+  private getTileSurface(): Path2D {
+    if (!this.cachedTileSurface) {
+      const s = new Path2D();
+      s.moveTo(0, 0);
+      s.lineTo(TILE_W / 2, TILE_H / 2);
+      s.lineTo(0, TILE_H);
+      s.lineTo(-TILE_W / 2, TILE_H / 2);
+      s.closePath();
+      this.cachedTileSurface = s;
+    }
+    return this.cachedTileSurface;
+  }
+
+  private getPathShape(): Path2D {
+    if (!this.cachedPathShape) {
+      const p = new Path2D();
+      p.moveTo(0, 4);
+      p.lineTo(28, 17);
+      p.lineTo(0, 30);
+      p.lineTo(-28, 17);
+      p.closePath();
+      this.cachedPathShape = p;
+    }
+    return this.cachedPathShape;
+  }
+
+  private rebuildBeautyCache(): void {
+    if (!this.beautyCacheDirty) return;
+    this.beautyCacheDirty = false;
+    this.beautyGrid.fill(0);
+    this.binPowerGrid.fill(0);
+    for (let y = 0; y < GRID_H; y++) {
+      for (let x = 0; x < GRID_W; x++) {
+        const sid = this.tiles[y][x].sceneryId;
+        if (!sid) continue;
+        const beauty = SCENERY[sid].beauty;
+        const bp = SCENERY[sid].binPower ?? 0;
+        for (let yy = Math.max(0, y - 2); yy <= Math.min(GRID_H - 1, y + 2); yy++) {
+          for (let xx = Math.max(0, x - 2); xx <= Math.min(GRID_W - 1, x + 2); xx++) {
+            const idx = yy * GRID_W + xx;
+            this.beautyGrid[idx] += beauty;
+            if (bp) this.binPowerGrid[idx] += bp;
+          }
+        }
+      }
+    }
+  }
+
+  private invalidateBeautyCache(): void {
+    this.beautyCacheDirty = true;
+  }
+
+  private refreshFrameCache(): void {
+    if (!this.frameCacheDirty) return;
+    this.frameCacheDirty = false;
+    if (this.guests.size === 0) {
+      this.cachedHappiness = 72;
+    } else {
+      let total = 0;
+      for (const g of this.guests.values()) total += g.happiness;
+      this.cachedHappiness = total / this.guests.size;
+    }
+    let litter = 0;
+    for (let y = 0; y < GRID_H; y++)
+      for (let x = 0; x < GRID_W; x++)
+        litter += this.tiles[y][x].litter;
+    this.cachedCleanliness = clamp(100 - litter * 4.5 + this.totalBinPower() * 4 - this.guests.size * 0.18, 38, 100);
   }
 
   private findRoute(start: Point, goal: Point): Point[] | null {
@@ -1231,29 +1419,17 @@ export class ThemeParkGame {
   }
 
   private averageHappiness(): number {
-    if (this.guests.size === 0) {
-      return 72;
-    }
-    let total = 0;
-    for (const guest of this.guests.values()) {
-      total += guest.happiness;
-    }
-    return total / this.guests.size;
+    this.refreshFrameCache();
+    return this.cachedHappiness;
   }
 
   private cleanlinessScore(): number {
-    let litter = 0;
-    for (let y = 0; y < GRID_H; y += 1) {
-      for (let x = 0; x < GRID_W; x += 1) {
-        litter += this.tiles[y][x].litter;
-      }
-    }
-    const score = 100 - litter * 4.5 + this.totalBinPower() * 4 - this.guests.size * 0.18;
-    return clamp(score, 38, 100);
+    this.refreshFrameCache();
+    return this.cachedCleanliness;
   }
 
   private parkLevel(): number {
-    return 1 + Math.floor((this.lifetimeRevenue + this.parkGrowth * 18 + this.attractionCount() * 120) / 1350);
+    return 1 + Math.floor((this.lifetimeRevenue + this.parkGrowth * 18 + this.attractionCount() * 120) / 900);
   }
 
   private attractionCount(): number {
@@ -1290,19 +1466,8 @@ export class ThemeParkGame {
   }
 
   private localBinPower(x: number, y: number): number {
-    let total = 0;
-    for (let yy = y - 2; yy <= y + 2; yy += 1) {
-      for (let xx = x - 2; xx <= x + 2; xx += 1) {
-        if (!this.inBounds(xx, yy)) {
-          continue;
-        }
-        const sceneryId = this.tiles[yy][xx].sceneryId;
-        if (sceneryId && SCENERY[sceneryId].binPower) {
-          total += SCENERY[sceneryId].binPower ?? 0;
-        }
-      }
-    }
-    return total;
+    this.rebuildBeautyCache();
+    return this.binPowerGrid[y * GRID_W + x];
   }
 
   private guestQueuePressure(): number {
@@ -1333,19 +1498,8 @@ export class ThemeParkGame {
   }
 
   private localBeauty(x: number, y: number): number {
-    let total = 0;
-    for (let yy = y - 2; yy <= y + 2; yy += 1) {
-      for (let xx = x - 2; xx <= x + 2; xx += 1) {
-        if (!this.inBounds(xx, yy)) {
-          continue;
-        }
-        const sceneryId = this.tiles[yy][xx].sceneryId;
-        if (sceneryId) {
-          total += SCENERY[sceneryId].beauty;
-        }
-      }
-    }
-    return total;
+    this.rebuildBeautyCache();
+    return this.beautyGrid[y * GRID_W + x];
   }
 
   private getTileDebug(x: number, y: number): Tile | null {
@@ -1379,11 +1533,16 @@ export class ThemeParkGame {
     return entryTile.terrain !== "water" && entryTile.structureId === undefined;
   }
 
-  private logEvent(message: string): void {
-    if (this.eventLog[0] === message) {
+  private logEvent(message: string, category: string = "info"): void {
+    const minutes = Math.floor(this.time / 60);
+    const seconds = Math.floor(this.time % 60);
+    const timestamp = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    const prefix = category === "warn" ? "[!] " : category === "earn" ? "[$] " : category === "build" ? "[+] " : "";
+    const formatted = `${prefix}${message} (${timestamp})`;
+    if (this.eventLog[0] === formatted) {
       return;
     }
-    this.eventLog.unshift(message);
+    this.eventLog.unshift(formatted);
     this.eventLog = this.eventLog.slice(0, 8);
   }
 
@@ -1421,6 +1580,8 @@ export class ThemeParkGame {
         return "";
       }
       const config = STRUCTURES[structure.typeId];
+      const statusClass = structure.status === "running" ? "good" : structure.status === "boarding" ? "alert" : "";
+      const queueClass = structure.queue.length > 5 ? "bad" : structure.queue.length > 2 ? "alert" : "good";
       return `
         <div class="selection-card">
           <h3 class="selection-title">${config.label}</h3>
@@ -1428,11 +1589,11 @@ export class ThemeParkGame {
           <div class="detail-grid">
             <div class="detail-chip">
               <div class="detail-label">Status</div>
-              <div class="detail-value">${structure.status}</div>
+              <div class="detail-value"><span class="badge ${statusClass}">${structure.status}</span></div>
             </div>
             <div class="detail-chip">
               <div class="detail-label">Queue</div>
-              <div class="detail-value">${structure.queue.length} guests</div>
+              <div class="detail-value"><span class="badge ${queueClass}">${structure.queue.length} guests</span></div>
             </div>
             <div class="detail-chip">
               <div class="detail-label">Cycle</div>
@@ -1442,6 +1603,26 @@ export class ThemeParkGame {
               <div class="detail-label">Revenue</div>
               <div class="detail-value">${formatMoney(structure.lifetimeRevenue)}</div>
             </div>
+            <div class="detail-chip">
+              <div class="detail-label">Ticket</div>
+              <div class="detail-value">${formatMoney(config.ticketPrice)}</div>
+            </div>
+            <div class="detail-chip">
+              <div class="detail-label">Upkeep</div>
+              <div class="detail-value">${formatMoney(config.upkeep)}/s</div>
+            </div>
+            <div class="detail-chip">
+              <div class="detail-label">${config.category === "ride" ? "Excitement" : "Hunger Relief"}</div>
+              <div class="detail-value">${config.category === "ride" ? config.excitement : config.appetite}</div>
+            </div>
+            <div class="detail-chip">
+              <div class="detail-label">Capacity</div>
+              <div class="detail-value">${config.capacity} / cycle</div>
+            </div>
+          </div>
+          <div class="selection-stats">
+            <span class="badge">${structure.lifetimeGuests} guests served</span>
+            <span class="badge">${structure.riders.length} riding</span>
           </div>
         </div>
       `;
@@ -1620,17 +1801,23 @@ export class ThemeParkGame {
             <h3 class="panel-title">${category}</h3>
             <div class="tool-grid">
               ${tools
-                .map((tool) => `
-                  <button class="tool-button ${tool.id === this.selectedTool ? "active" : ""}" data-tool="${tool.id}">
+                .map((tool) => {
+                  const canAfford = this.money >= tool.cost;
+                  const activeClass = tool.id === this.selectedTool ? "active" : "";
+                  const affordClass = !canAfford && tool.cost > 0 ? "unaffordable" : "";
+                  return `
+                  <button class="tool-button ${activeClass} ${affordClass}" data-tool="${tool.id}">
                     <div class="tool-header">
                       <span class="tool-icon">${buildIconSvg(tool.id)}</span>
                       <div>
                         <div class="tool-name">${tool.label}</div>
-                        <div class="tool-cost">${tool.cost ? formatMoney(tool.cost) : "Free"} · ${tool.description}</div>
+                        <div class="tool-cost">${tool.cost ? `<span class="cost-tag ${affordClass}">${formatMoney(tool.cost)}</span>` : `<span class="cost-tag free">Free</span>`}</div>
+                        <div class="tool-desc">${tool.description}</div>
                       </div>
                     </div>
                   </button>
-                `)
+                `;
+                })
                 .join("")}
             </div>
           </section>
@@ -1706,8 +1893,14 @@ export class ThemeParkGame {
         <h3 class="panel-title">Park Log</h3>
         <div class="list">
           ${this.eventLog
-            .slice(0, 5)
-            .map((entry) => `<div class="list-card"><div class="list-meta">${entry}</div></div>`)
+            .slice(0, 6)
+            .map((entry) => {
+              const isWarn = entry.startsWith("[!]");
+              const isEarn = entry.startsWith("[$]");
+              const isBuild = entry.startsWith("[+]");
+              const logClass = isWarn ? "log-warn" : isEarn ? "log-earn" : isBuild ? "log-build" : "log-info";
+              return `<div class="list-card ${logClass}"><div class="list-meta">${entry}</div></div>`;
+            })
             .join("")}
         </div>
       </section>
@@ -1734,50 +1927,63 @@ export class ThemeParkGame {
     ctx.translate(this.camera.x, this.camera.y);
     ctx.scale(this.camera.zoom, this.camera.zoom);
 
-    const entities: Array<{ depth: number; draw: () => void }> = [];
+    // Viewport culling bounds in world space
+    const invZoom = 1 / this.camera.zoom;
+    const viewLeft = -this.camera.x * invZoom - TILE_W * 2;
+    const viewRight = (this.width - this.camera.x) * invZoom + TILE_W * 2;
+    const viewTop = -this.camera.y * invZoom - TILE_H * 4;
+    const viewBottom = (this.height - this.camera.y) * invZoom + TILE_H * 4;
 
+    // Pass 1: Draw all terrain tiles (they are always behind everything else)
     for (let y = 0; y < GRID_H; y += 1) {
       for (let x = 0; x < GRID_W; x += 1) {
-        const tile = this.tiles[y][x];
         const isoX = (x - y) * (TILE_W / 2);
         const isoY = (x + y) * (TILE_H / 2);
-
-        this.drawTerrainTile(ctx, tile, isoX, isoY, x, y);
-
-        entities.push({
-          depth: x + y + 0.1,
-          draw: () => {
-            if (tile.path) {
-              this.drawPathTile(ctx, isoX, isoY, tile.litter);
-            }
-            if (tile.sceneryId) {
-              this.drawScenery(ctx, tile.sceneryId, isoX, isoY);
-            }
-            if (this.hoverTile?.x === x && this.hoverTile?.y === y) {
-              this.drawTileOutline(ctx, isoX, isoY, "#f6b95f", 0.85);
-            }
-          }
-        });
+        if (isoX < viewLeft || isoX > viewRight || isoY < viewTop || isoY > viewBottom) continue;
+        this.drawTerrainTile(ctx, this.tiles[y][x], isoX, isoY, x, y);
       }
     }
 
-    for (const structure of this.structures.values()) {
-      entities.push({
-        depth: structure.x + structure.y + STRUCTURES[structure.typeId].footprint.x + STRUCTURES[structure.typeId].footprint.y,
-        draw: () => this.drawStructure(ctx, structure)
-      });
+    // Pass 2: Draw paths, scenery, structures, and guests in depth order
+    // Isometric depth = x + y. We iterate diagonals from 0 to GRID_W+GRID_H-2.
+    // Build structure/guest lookup by depth band
+    const structsByDepth = new Map<number, StructureInstance[]>();
+    for (const s of this.structures.values()) {
+      const d = s.x + s.y + STRUCTURES[s.typeId].footprint.x + STRUCTURES[s.typeId].footprint.y;
+      let arr = structsByDepth.get(d);
+      if (!arr) { arr = []; structsByDepth.set(d, arr); }
+      arr.push(s);
+    }
+    const guestsByDepth = new Map<number, Guest[]>();
+    for (const g of this.guests.values()) {
+      const d = g.tile.x + g.tile.y + 1;
+      let arr = guestsByDepth.get(d);
+      if (!arr) { arr = []; guestsByDepth.set(d, arr); }
+      arr.push(g);
     }
 
-    for (const guest of this.guests.values()) {
-      entities.push({
-        depth: guest.tile.x + guest.tile.y + 0.9,
-        draw: () => this.drawGuest(ctx, guest)
-      });
-    }
+    for (let diag = 0; diag < GRID_W + GRID_H - 1; diag++) {
+      const yMin = Math.max(0, diag - GRID_W + 1);
+      const yMax = Math.min(diag, GRID_H - 1);
+      for (let y = yMin; y <= yMax; y++) {
+        const x = diag - y;
+        const tile = this.tiles[y][x];
+        const isoX = (x - y) * (TILE_W / 2);
+        const isoY = (x + y) * (TILE_H / 2);
+        if (isoX < viewLeft || isoX > viewRight || isoY < viewTop || isoY > viewBottom) continue;
 
-    entities.sort((a, b) => a.depth - b.depth);
-    for (const entity of entities) {
-      entity.draw();
+        if (tile.path) this.drawPathTile(ctx, isoX, isoY, tile.litter);
+        if (tile.sceneryId) this.drawScenery(ctx, tile.sceneryId, isoX, isoY);
+        if (this.hoverTile?.x === x && this.hoverTile?.y === y) {
+          this.drawTileOutline(ctx, isoX, isoY, "#f6b95f", 0.85);
+        }
+      }
+
+      // Draw structures and guests at this depth
+      const structs = structsByDepth.get(diag);
+      if (structs) for (const s of structs) this.drawStructure(ctx, s);
+      const guests = guestsByDepth.get(diag);
+      if (guests) for (const g of guests) this.drawGuest(ctx, g);
     }
 
     if (this.hoverTile) {
@@ -1788,106 +1994,53 @@ export class ThemeParkGame {
   }
 
   private renderBackdrop(ctx: CanvasRenderingContext2D): void {
-    const gradient = ctx.createLinearGradient(0, 0, 0, this.height);
-    gradient.addColorStop(0, "#f9e9c9");
-    gradient.addColorStop(0.55, "#f5dab1");
-    gradient.addColorStop(1, "#e8c08f");
-    ctx.fillStyle = gradient;
+    // Flat background color - skip gradient, backdrop image, and cloud ellipses for performance
+    ctx.fillStyle = "#f2d9a8";
     ctx.fillRect(0, 0, this.width, this.height);
-
-    const shellBackdrop = this.getArtAsset("shellBackdrop");
-    if (shellBackdrop) {
-      const scale = Math.max(this.width / shellBackdrop.width, this.height / shellBackdrop.height);
-      const width = shellBackdrop.width * scale;
-      const height = shellBackdrop.height * scale;
-      ctx.save();
-      ctx.globalAlpha = 0.2;
-      ctx.drawImage(shellBackdrop, (this.width - width) * 0.5, (this.height - height) * 0.38, width, height);
-      ctx.restore();
-    }
-
-    ctx.fillStyle = "rgba(255,255,255,0.22)";
-    for (let index = 0; index < 5; index += 1) {
-      const x = this.width * (0.12 + index * 0.18);
-      const y = 80 + Math.sin(this.time * 0.1 + index) * 18;
-      ctx.beginPath();
-      ctx.ellipse(x, y, 80, 24, 0, 0, Math.PI * 2);
-      ctx.ellipse(x + 34, y + 6, 56, 20, 0, 0, Math.PI * 2);
-      ctx.ellipse(x - 36, y + 4, 46, 18, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
   }
 
   private drawTerrainTile(ctx: CanvasRenderingContext2D, tile: Tile, isoX: number, isoY: number, x: number, y: number): void {
     ctx.save();
     ctx.translate(isoX, isoY);
 
-    const colorTop = tile.terrain === "grass" ? "#78b364" : "#63b9cb";
-    const colorLeft = tile.terrain === "grass" ? "#5f944e" : "#4290a8";
-    const colorRight = tile.terrain === "grass" ? "#8fc777" : "#7bcfdf";
+    const isGrass = tile.terrain === "grass";
+    const surface = this.getTileSurface();
 
-    const surface = new Path2D();
-    surface.moveTo(0, 0);
-    surface.lineTo(TILE_W / 2, TILE_H / 2);
-    surface.lineTo(0, TILE_H);
-    surface.lineTo(-TILE_W / 2, TILE_H / 2);
-    surface.closePath();
-
-    const fill = ctx.createLinearGradient(0, 0, 0, TILE_H);
-    fill.addColorStop(0, colorTop);
-    fill.addColorStop(1, colorRight);
-    ctx.fillStyle = fill;
+    // Flat color fill - skip gradient and texture for performance
+    ctx.fillStyle = isGrass ? "#7ab86a" : "#6ec4d5";
     ctx.fill(surface);
 
-    const terrainTexture = tile.terrain === "grass" ? this.getArtAsset("grassTexture") : this.getArtAsset("waterTexture");
-    if (terrainTexture) {
-      this.drawTexturedShape(
-        ctx,
-        surface,
-        terrainTexture,
-        x,
-        y,
-        { x: -TILE_W / 2 - 4, y: -2, width: TILE_W + 8, height: TILE_H + 8 },
-        tile.terrain === "grass" ? 0.22 : 0.4,
-        tile.terrain === "water" ? Math.sin(this.time * 0.9 + x * 0.4 + y * 0.35) * 2.5 : 0
-      );
-    }
-
+    // Side faces
+    ctx.fillStyle = isGrass ? "#5f944e" : "#4290a8";
     ctx.beginPath();
     ctx.moveTo(-TILE_W / 2, TILE_H / 2);
     ctx.lineTo(0, TILE_H);
     ctx.lineTo(0, TILE_H + 14);
     ctx.lineTo(-TILE_W / 2, TILE_H / 2 + 14);
     ctx.closePath();
-    ctx.fillStyle = colorLeft;
     ctx.fill();
 
+    ctx.fillStyle = isGrass ? "#8fc777" : "#7bcfdf";
     ctx.beginPath();
     ctx.moveTo(TILE_W / 2, TILE_H / 2);
     ctx.lineTo(0, TILE_H);
     ctx.lineTo(0, TILE_H + 14);
     ctx.lineTo(TILE_W / 2, TILE_H / 2 + 14);
     ctx.closePath();
-    ctx.fillStyle = colorRight;
     ctx.fill();
 
     ctx.strokeStyle = "rgba(40, 65, 36, 0.16)";
     ctx.lineWidth = 1;
     ctx.stroke(surface);
 
-    if (tile.terrain === "grass") {
-      ctx.fillStyle = "rgba(255, 255, 255, 0.08)";
-      for (let i = 0; i < 5; i += 1) {
-        const px = -20 + rand(x * 17 + y * 31 + i) * 40;
-        const py = 6 + rand(x * 23 + y * 11 + i) * 20;
-        ctx.fillRect(px, py, 2, 2);
-      }
-    } else {
-      ctx.strokeStyle = `rgba(255,255,255,${0.16 + 0.08 * Math.sin(this.time * 2 + x * 0.6 + y * 0.4)})`;
+    // Water gets a simple animated line
+    if (!isGrass) {
+      ctx.strokeStyle = "rgba(255,255,255,0.18)";
       ctx.lineWidth = 1.1;
       ctx.beginPath();
-      ctx.moveTo(-18, 15 + Math.sin(this.time * 2 + x) * 1.8);
-      ctx.quadraticCurveTo(0, 11 + Math.sin(this.time * 2 + x + 1) * 2.4, 18, 15 + Math.sin(this.time * 2 + x + 2) * 1.8);
+      const waveY = Math.sin(this.time * 2 + x * 0.6 + y * 0.4) * 1.8;
+      ctx.moveTo(-18, 15 + waveY);
+      ctx.lineTo(18, 15 - waveY);
       ctx.stroke();
     }
 
@@ -1897,41 +2050,12 @@ export class ThemeParkGame {
   private drawPathTile(ctx: CanvasRenderingContext2D, isoX: number, isoY: number, litter: number): void {
     ctx.save();
     ctx.translate(isoX, isoY);
-    const pathShape = new Path2D();
-    pathShape.moveTo(0, 4);
-    pathShape.lineTo(28, 17);
-    pathShape.lineTo(0, 30);
-    pathShape.lineTo(-28, 17);
-    pathShape.closePath();
-    const fill = ctx.createLinearGradient(0, 4, 0, 30);
-    fill.addColorStop(0, "#f2ead8");
-    fill.addColorStop(1, "#ddceb4");
-    ctx.fillStyle = fill;
+    const pathShape = this.getPathShape();
+
+    ctx.fillStyle = "#e8dfc8";
     ctx.fill(pathShape);
-
-    const pathTexture = this.getArtAsset("pathTexture");
-    if (pathTexture) {
-      this.drawTexturedShape(
-        ctx,
-        pathShape,
-        pathTexture,
-        isoX,
-        isoY,
-        { x: -30, y: 2, width: 60, height: 30 },
-        0.32
-      );
-    }
-
     ctx.strokeStyle = "rgba(86, 64, 33, 0.14)";
     ctx.stroke(pathShape);
-
-    ctx.strokeStyle = "rgba(135, 108, 74, 0.18)";
-    for (let i = -18; i <= 18; i += 9) {
-      ctx.beginPath();
-      ctx.moveTo(i, 12 + Math.abs(i) * 0.1);
-      ctx.lineTo(i + 6, 20 + Math.abs(i) * 0.05);
-      ctx.stroke();
-    }
 
     if (litter > 0.1) {
       ctx.fillStyle = "rgba(184, 106, 72, 0.55)";
@@ -1946,9 +2070,6 @@ export class ThemeParkGame {
   private drawScenery(ctx: CanvasRenderingContext2D, id: SceneryTypeId, isoX: number, isoY: number): void {
     ctx.save();
     ctx.translate(isoX, isoY);
-    ctx.shadowColor = "rgba(42, 28, 18, 0.18)";
-    ctx.shadowBlur = 12;
-    ctx.shadowOffsetY = 6;
 
     switch (id) {
       case "tree":
@@ -2058,14 +2179,10 @@ export class ThemeParkGame {
 
     ctx.save();
     ctx.translate(origin.x, origin.y);
-    ctx.shadowColor = "rgba(48, 25, 8, 0.22)";
-    ctx.shadowBlur = 14;
-    ctx.shadowOffsetY = 8;
     ctx.fillStyle = "rgba(74, 50, 29, 0.22)";
     ctx.beginPath();
     ctx.ellipse(0, h * 14 + 32, width * 0.82, 18, 0, 0, Math.PI * 2);
     ctx.fill();
-    ctx.shadowBlur = 0;
 
     const [main, accent, trim] = config.palette;
     this.drawIsoPlatform(ctx, w, h, main, trim);
