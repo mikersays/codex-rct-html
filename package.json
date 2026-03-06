@@ -1,0 +1,17 @@
+{
+  "name": "codex-rpg",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "playtest": "node scripts/playtest.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.58.2",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3"
+  }
+}
